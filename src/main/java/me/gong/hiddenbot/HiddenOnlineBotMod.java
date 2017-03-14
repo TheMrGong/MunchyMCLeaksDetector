@@ -1,0 +1,295 @@
+package me.gong.hiddenbot;
+
+import com.mojang.realmsclient.gui.ChatFormatting;
+import me.gong.hiddenbot.api.ingame.bans.IBanTracker;
+import me.gong.hiddenbot.api.ingame.bans.impl.BanTracker;
+import me.gong.hiddenbot.api.ingame.global.IBroadcaster;
+import me.gong.hiddenbot.api.ingame.global.impl.GlobalBroadcaster;
+import me.gong.hiddenbot.api.ingame.message.IMessenger;
+import me.gong.hiddenbot.api.ingame.message.Messenger;
+import me.gong.hiddenbot.cmd.CommandManager;
+import me.gong.hiddenbot.request.HiddenStaffFetcher;
+import me.gong.hiddenbot.util.*;
+import net.minecraft.client.Minecraft;
+import net.minecraftforge.client.event.ClientChatReceivedEvent;
+import net.minecraftforge.common.MinecraftForge;
+import net.minecraftforge.fml.common.Mod;
+import net.minecraftforge.fml.common.ModMetadata;
+import net.minecraftforge.fml.common.event.FMLInitializationEvent;
+import net.minecraftforge.fml.common.event.FMLPreInitializationEvent;
+import net.minecraftforge.fml.common.eventhandler.SubscribeEvent;
+import net.minecraftforge.fml.common.gameevent.TickEvent;
+import net.minecraftforge.fml.relauncher.Side;
+import net.minecraftforge.fml.relauncher.SideOnly;
+
+import java.io.BufferedReader;
+import java.io.File;
+import java.io.FileReader;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.stream.Stream;
+
+import static me.gong.hiddenbot.HiddenOnlineBotMod.*;
+
+@SideOnly(Side.CLIENT)
+@Mod(modid = MOD_ID, name = NAME, version = VERSION, acceptedMinecraftVersions = ACCEPTED_VERSIONS)
+public class HiddenOnlineBotMod {
+
+    private static final String UNSUBSCRIBED_FILE = "unsubscribedPlayers.dat", BANTRACKER_FILE = "trackedBans.dat";
+    public static final String PREFIX = "[HiddenBot]";
+    private static final long JOINLEAVE_DELAY = TimeUnit.MILLISECONDS.convert(1, TimeUnit.MINUTES);
+
+    private static final ExecutorService POOL = Executors.newFixedThreadPool(5);
+    public static final String MOD_ID = "gong_hiddenbot", NAME = "Gongs Addons: HiddenBot", VERSION = "1.0", ACCEPTED_VERSIONS = "[1.8,)";
+
+    @Mod.Instance(MOD_ID)
+    public static HiddenOnlineBotMod INSTANCE;
+
+    public static final String MCLEAKS_LIST = ".listleak";
+    private static final Pattern CHAT_PATTERN = Pattern.compile("<([\\w_]{3,16}+ )?([^>]+)> (.*)"),
+            MESSAGED_PATTERN = Pattern.compile("<([\\w_]{3,16}) -> ([\\w_]{3,16})> (.*)");
+
+    private MCLeaksAccountCache mcleaksCache = new MCLeaksAccountCache(2, TimeUnit.MINUTES);
+
+    private QueuedJoinLeaves queued;
+    private long lastJoinLeaveBroadcast;
+
+    private List<ISavable> savables = new ArrayList<>();
+    private HiddenStaffFetcher fetcher;
+    private IBroadcaster broadcaster;
+    private IMessenger messenger;
+    private IBanTracker banTracker;
+
+    private CommandManager commandManager;
+    private boolean enable = true;
+
+    public void onPlayerJoin(String player) {
+        if (SessionUtils.getSession().getProfile().getName().equalsIgnoreCase(player) || !enable) return; //bruh
+        getList(list -> {
+            if (list.contains(player.toLowerCase())) {
+                if (System.currentTimeMillis() - lastJoinLeaveBroadcast < JOINLEAVE_DELAY) {
+                    if (queued == null)
+                        queued = new QueuedJoinLeaves();
+                    queued.getLeft().remove(player);
+                    queued.getJoined().add(player);
+                } else {
+                    messenger.broadcastMessage("Caution, MCLeaks Account " + player + " is now online. (" + MCLEAKS_LIST + " to view all)");
+                    lastJoinLeaveBroadcast = System.currentTimeMillis();
+                }
+            }
+        });
+    }
+
+    public void onPlayerQuit(String player) {
+        if (SessionUtils.getSession().getProfile().getName().equalsIgnoreCase(player) || !enable) return; //bruh
+        getList(list -> {
+
+            if (list.contains(player.toLowerCase())) {
+                if (System.currentTimeMillis() - lastJoinLeaveBroadcast < JOINLEAVE_DELAY) {
+                    if (queued == null)
+                        queued = new QueuedJoinLeaves();
+                    queued.getJoined().remove(player);
+                    queued.getLeft().add(player);
+                } else {
+                    messenger.broadcastMessage("MCLeaks account " + player + " has left. (/msg me " + MCLEAKS_LIST + " to view remaining)");
+                    lastJoinLeaveBroadcast = System.currentTimeMillis();
+                }
+            }
+        });
+    }
+
+    @Mod.EventHandler
+    public void preInit(FMLPreInitializationEvent e) {
+        final ModMetadata metadata = e.getModMetadata();
+        metadata.authorList.add(ChatFormatting.BLUE + "TheMrGong");
+        metadata.autogenerated = false;
+        metadata.description = ChatFormatting.YELLOW + "Bot that displays the number of hidden staff. In-game command: \".help\"";
+    }
+
+    @Mod.EventHandler
+    public void load(FMLInitializationEvent e) {
+
+        fetcher = new HiddenStaffFetcher();
+        banTracker = registerSavable(new BanTracker(new File(BANTRACKER_FILE)));
+        broadcaster = registerSavable(new GlobalBroadcaster(new File(UNSUBSCRIBED_FILE)));
+        messenger = new Messenger(broadcaster);
+
+        commandManager = new CommandManager(); //has error if not initialized here. (weird)
+
+        MinecraftForge.EVENT_BUS.register(this);
+        MinecraftForge.EVENT_BUS.register(fetcher);
+        MinecraftForge.EVENT_BUS.register(new LoginListener());
+
+    }
+
+    @SubscribeEvent
+    public void onChat(ClientChatReceivedEvent ev) {
+        String player = null, message = null;
+        String text = ChatColor.stripColor(ev.message.getFormattedText());
+
+        banTracker.handleChat(text);
+
+        text = text.toLowerCase();
+
+        Matcher chat = CHAT_PATTERN.matcher(text), msged = MESSAGED_PATTERN.matcher(text);
+        boolean isUsingPublicChat = false, isCommand;
+        if (msged.find()) {
+            player = msged.group(1);
+            if (player.equalsIgnoreCase(Minecraft.getMinecraft().getSession().getUsername()))
+                return; //bot messaged someone
+            message = msged.group(3);
+        } else if (chat.find()) {
+            isUsingPublicChat = true;
+            player = chat.group(2);
+            message = chat.group(3);
+            if (player.equalsIgnoreCase(Minecraft.getMinecraft().getSession().getUsername())) return;
+        }
+        if (message == null) return;
+        final String thePlayer = player;
+
+        isCommand = commandManager.processInput(player, message);
+
+        if (isCommand && isUsingPublicChat)
+            messenger.sendPM(thePlayer, "You are recommended to /msg me instead of using public chat");
+    }
+
+    @SubscribeEvent
+    public void onTick(TickEvent.PlayerTickEvent ev) {
+        broadcaster.runTick();
+
+        if (queued != null && queued.getTimeSinceQueue() > JOINLEAVE_DELAY) {
+            broadcaster.broadcastMessage("Recent MCLeaks accounts: " + queued.getJoined().size() + " joined, " + queued.getLeft().size() + " left (.listleaks to view all)");
+            queued = null;
+            lastJoinLeaveBroadcast = System.currentTimeMillis();
+        }
+
+        final ISavable[] iSavables = savables.stream().filter(ISavable::isDirty).toArray(ISavable[]::new);
+        if (iSavables.length > 0) {
+            Stream.of(iSavables).forEach(i -> i.setDirty(false)); //prevent next tick from trying to save again when already queued
+            POOL.submit(() -> {
+                for (ISavable iSavable : iSavables) {
+                    try {
+                        iSavable.save();
+                    } catch (IOException e) {
+                        throw new RuntimeException("Error occured saving " + iSavable.getClass().getSimpleName(), e);
+                    }
+                }
+            });
+        }
+    }
+
+    private <T extends ISavable> T registerSavable(T savable) {
+        this.savables.add(savable);
+        return savable;
+    }
+
+    private void getList(Consumer<Set<String>> callback) {
+        if (mcleaksCache.hasExpired()) {
+            if (mcleaksCache.fetchingQueued) {
+                POOL.submit(() -> {
+                    while (mcleaksCache.fetchingQueued) {
+                        try {
+                            Thread.sleep(1);
+                        } catch (InterruptedException e) {
+                            e.printStackTrace();
+                        }
+                    }
+                    callback.accept(mcleaksCache.accounts);
+                });
+                return;
+            }
+            mcleaksCache.fetchingQueued();
+            POOL.submit(() -> {
+                mcleaksCache.setAccounts(fetchListSync());
+                callback.accept(mcleaksCache.accounts);
+            });
+        } else callback.accept(mcleaksCache.accounts);
+    }
+
+    private Set<String> fetchListSync() {
+        File f = new File(new File("."), "mcleaksList.txt");
+        if (!f.exists()) return new HashSet<>();
+        Set<String> s = new HashSet<>();
+        try (BufferedReader r = new BufferedReader(new FileReader(f))) {
+            String line;
+            while ((line = r.readLine()) != null) {
+                if (!line.trim().isEmpty()) s.add(line.trim().split(":")[0].toLowerCase());
+            }
+            return s;
+        } catch (IOException ex) {
+            ex.printStackTrace();
+            return new HashSet<>();
+        }
+    }
+
+    public MCLeaksAccountCache getMcleaksCache() {
+        return mcleaksCache;
+    }
+
+    public HiddenStaffFetcher getFetcher() {
+        return fetcher;
+    }
+
+    public IMessenger getMessenger() {
+        return messenger;
+    }
+
+    public CommandManager getCommandManager() {
+        return commandManager;
+    }
+
+    public IBroadcaster getBroadcaster() {
+        return broadcaster;
+    }
+
+    public IBanTracker getBanTracker() {
+        return banTracker;
+    }
+
+    public void setEnabled(boolean enabled) {
+        this.enable = enabled;
+    }
+
+    public boolean isEnabled() {
+        return enable;
+    }
+
+    public static class MCLeaksAccountCache {
+        private Set<String> accounts = new HashSet<>();
+        private long lastUpdate, expireAfter;
+        private volatile boolean fetchingQueued;
+
+        public MCLeaksAccountCache(long expireAfter, TimeUnit type) {
+            this.expireAfter = TimeUnit.MILLISECONDS.convert(expireAfter, type);
+        }
+
+        public void fetchingQueued() {
+            this.fetchingQueued = true;
+        }
+
+        public void setAccounts(Set<String> accounts) {
+            this.accounts = accounts;
+            this.fetchingQueued = false;
+            this.lastUpdate = System.currentTimeMillis();
+        }
+
+        public boolean containsAccount(String name) {
+            return this.accounts.contains(name.toLowerCase());
+        }
+
+        public boolean hasExpired() {
+            return System.currentTimeMillis() - lastUpdate > expireAfter;
+        }
+    }
+
+
+}

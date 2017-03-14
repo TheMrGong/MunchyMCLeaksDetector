@@ -1,0 +1,26 @@
+# idea
+out
+*.ipr
+*.iws
+.idea
+
+# general
+*.txt
+
+# gradle
+build
+.gradle
+gradle/
+gradlew
+gradlew.bat
+
+# other
+eclipse
+run
+build.gradle
+forge-1.8.9-11.15.1.1722-mdk.zip
+
+# misc
+real_request/
+src/api/
+src/test/

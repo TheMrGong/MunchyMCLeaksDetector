@@ -1,0 +1,8 @@
+[
+  {
+    "modid": "gong_hiddenbot",
+    "name": "Gongs Addons: Hidden Bot",
+    "version": "${version}",
+    "mcversion": "${mcversion}"
+  }
+]
